@@ -181,13 +181,6 @@ def filter_blobs_by_date(
 def parse_timestamp(value: object) -> Optional[datetime]:
     """
     Parse a Ping AIC ISO timestamp.
-
-    Supported examples:
-
-        2026-08-26T10:15:23
-        2026-08-26T10:15:23.123
-        2026-08-26T10:15:23.123Z
-        2026-08-26T10:15:23+00:00
     """
     if not isinstance(value, str):
         return None
@@ -225,6 +218,31 @@ def floor_to_minute(value: datetime) -> datetime:
     )
 
 
+def get_message_size(entry: dict) -> int:
+    """
+    Return the UTF-8 size of a log message in bytes.
+
+    A compact JSON representation is used so the measurement reflects
+    the data itself rather than pretty-printing whitespace.
+
+    Example:
+
+        {"timestamp":"...","payload":{...}}
+
+    The result represents the normalized JSON message size rather than
+    the exact byte range occupied by the entry inside the source blob.
+    """
+    serialized = json.dumps(
+        entry,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    return len(
+        serialized.encode("utf-8")
+    )
+
+
 def initialize_minute_buckets(
     start_dt: datetime,
     end_dt: datetime,
@@ -232,7 +250,7 @@ def initialize_minute_buckets(
     """
     Create every minute bucket touched by the requested period.
 
-    This intentionally includes minutes with zero messages.
+    Minutes containing zero messages are deliberately included.
     """
     buckets: Dict[datetime, int] = {}
 
@@ -289,15 +307,15 @@ def process_blob(
     messages_per_minute: Dict[datetime, int],
 ) -> Tuple[dict, bool]:
     """
-    Count messages from one blob.
+    Count messages from one blob and collect message-size statistics.
 
     Returns:
 
         counters
         reached_end
 
-    Since entries and blobs are chronologically ordered, reached_end=True
-    allows the caller to stop processing all later blobs.
+    Because entries and blobs are chronologically ordered,
+    reached_end=True allows the caller to stop processing later blobs.
     """
     print(f"\nProcessing {blob_name}")
 
@@ -305,6 +323,12 @@ def process_blob(
         "entries_seen": 0,
         "entries_in_period": 0,
         "invalid_timestamps": 0,
+
+        # Message-size statistics for this blob.
+        "message_size_count": 0,
+        "message_size_total": 0,
+        "message_size_min": None,
+        "message_size_max": None,
     }
 
     reached_end = False
@@ -323,7 +347,7 @@ def process_blob(
             counters["invalid_timestamps"] += 1
             continue
 
-        # Entries are known to be ordered oldest -> newest.
+        # Entries are ordered oldest -> newest.
         if ts_dt > end_dt:
             reached_end = True
             break
@@ -335,10 +359,29 @@ def process_blob(
 
         minute = floor_to_minute(ts_dt)
 
-        # This should normally always exist, because the bucket set was
-        # generated from start/end, but guard against malformed data.
         if minute in messages_per_minute:
             messages_per_minute[minute] += 1
+
+        # ----------------------------------------------------------
+        # Message-size statistics
+        # ----------------------------------------------------------
+
+        message_size = get_message_size(entry)
+
+        counters["message_size_count"] += 1
+        counters["message_size_total"] += message_size
+
+        if (
+            counters["message_size_min"] is None
+            or message_size < counters["message_size_min"]
+        ):
+            counters["message_size_min"] = message_size
+
+        if (
+            counters["message_size_max"] is None
+            or message_size > counters["message_size_max"]
+        ):
+            counters["message_size_max"] = message_size
 
     print(
         f"  {counters['entries_in_period']:,} "
@@ -394,11 +437,6 @@ def calculate_statistics(
         if count == maximum
     ]
 
-    # Inclusive message selection is used:
-    #
-    #   start_dt <= timestamp <= end_dt
-    #
-    # For rate reporting, elapsed wall-clock time is sufficient.
     period_seconds = max(
         (end_dt - start_dt).total_seconds(),
         0.0,
@@ -423,12 +461,57 @@ def calculate_statistics(
     }
 
 
+def calculate_message_size_statistics(
+    message_size_count: int,
+    message_size_total: int,
+    message_size_min: Optional[int],
+    message_size_max: Optional[int],
+) -> dict:
+    """
+    Calculate overall message-size statistics.
+    """
+    if message_size_count == 0:
+        return {
+            "count": 0,
+            "minimum": 0,
+            "average": 0.0,
+            "maximum": 0,
+        }
+
+    return {
+        "count": message_size_count,
+        "minimum": (
+            message_size_min
+            if message_size_min is not None
+            else 0
+        ),
+        "average": (
+            message_size_total
+            / message_size_count
+        ),
+        "maximum": (
+            message_size_max
+            if message_size_max is not None
+            else 0
+        ),
+    }
+
+
+def bytes_to_kib(value: float) -> float:
+    """
+    Convert bytes to KiB.
+    """
+    return value / 1024.0
+
+
 def write_csv_report(
     output_path: str,
     messages_per_minute: Dict[datetime, int],
 ) -> None:
     """
     Write the per-minute throughput table as CSV.
+
+    Message-size statistics are intentionally not included here.
     """
     with open(
         output_path,
@@ -468,6 +551,9 @@ def write_json_report(
 ) -> None:
     """
     Write detailed JSON output.
+
+    Message-size statistics are intentionally not included because
+    they are summary-only metrics.
     """
     report = {
         "period": {
@@ -534,6 +620,7 @@ def write_summary_log(
     start_dt: datetime,
     end_dt: datetime,
     statistics: dict,
+    message_size_statistics: dict,
     blobs_processed: int,
     entries_seen: int,
     invalid_timestamps: int,
@@ -589,6 +676,14 @@ def write_summary_log(
     lines.append("")
 
     lines.append(
+        "MESSAGE THROUGHPUT"
+    )
+
+    lines.append(
+        "-" * 60
+    )
+
+    lines.append(
         f"Minimum / minute:     "
         f"{statistics['minimum_per_minute']:,}"
     )
@@ -611,7 +706,35 @@ def write_summary_log(
     lines.append("")
 
     lines.append(
-        "Minimum observed at:"
+        "MESSAGE SIZE"
+    )
+
+    lines.append(
+        "-" * 60
+    )
+
+    lines.append(
+        f"Minimum message size: "
+        f"{message_size_statistics['minimum']:,} bytes "
+        f"({bytes_to_kib(message_size_statistics['minimum']):,.2f} KiB)"
+    )
+
+    lines.append(
+        f"Average message size: "
+        f"{message_size_statistics['average']:,.2f} bytes "
+        f"({bytes_to_kib(message_size_statistics['average']):,.2f} KiB)"
+    )
+
+    lines.append(
+        f"Maximum message size: "
+        f"{message_size_statistics['maximum']:,} bytes "
+        f"({bytes_to_kib(message_size_statistics['maximum']):,.2f} KiB)"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "Minimum throughput observed at:"
     )
 
     for minute in statistics["minimum_minutes"]:
@@ -620,7 +743,7 @@ def write_summary_log(
         )
 
     lines.append(
-        "Maximum observed at:"
+        "Maximum throughput observed at:"
     )
 
     for minute in statistics["maximum_minutes"]:
@@ -671,7 +794,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Calculate Ping AIC log-message throughput "
-            "per minute from Azure Blob Storage audit logs."
+            "per minute and message-size statistics "
+            "from Azure Blob Storage audit logs."
         )
     )
 
@@ -794,6 +918,12 @@ def main() -> int:
         "entries_seen": 0,
         "entries_in_period": 0,
         "invalid_timestamps": 0,
+
+        # Global message-size aggregation.
+        "message_size_count": 0,
+        "message_size_total": 0,
+        "message_size_min": None,
+        "message_size_max": None,
     }
 
     successfully_processed_blobs = []
@@ -822,8 +952,47 @@ def main() -> int:
             blob_name
         )
 
-        for key in totals:
-            totals[key] += blob_counters[key]
+        totals["entries_seen"] += (
+            blob_counters["entries_seen"]
+        )
+
+        totals["entries_in_period"] += (
+            blob_counters["entries_in_period"]
+        )
+
+        totals["invalid_timestamps"] += (
+            blob_counters["invalid_timestamps"]
+        )
+
+        totals["message_size_count"] += (
+            blob_counters["message_size_count"]
+        )
+
+        totals["message_size_total"] += (
+            blob_counters["message_size_total"]
+        )
+
+        blob_min = blob_counters[
+            "message_size_min"
+        ]
+
+        if blob_min is not None:
+            if (
+                totals["message_size_min"] is None
+                or blob_min < totals["message_size_min"]
+            ):
+                totals["message_size_min"] = blob_min
+
+        blob_max = blob_counters[
+            "message_size_max"
+        ]
+
+        if blob_max is not None:
+            if (
+                totals["message_size_max"] is None
+                or blob_max > totals["message_size_max"]
+            ):
+                totals["message_size_max"] = blob_max
 
         if reached_end:
 
@@ -838,6 +1007,23 @@ def main() -> int:
         messages_per_minute=messages_per_minute,
         start_dt=start_dt,
         end_dt=end_dt,
+    )
+
+    message_size_statistics = (
+        calculate_message_size_statistics(
+            message_size_count=totals[
+                "message_size_count"
+            ],
+            message_size_total=totals[
+                "message_size_total"
+            ],
+            message_size_min=totals[
+                "message_size_min"
+            ],
+            message_size_max=totals[
+                "message_size_max"
+            ],
+        )
     )
 
     start_str = start_dt.strftime(
@@ -878,6 +1064,8 @@ def main() -> int:
         messages_per_minute=messages_per_minute,
     )
 
+    # Deliberately unchanged:
+    # message-size metrics are summary-only.
     write_json_report(
         output_path=json_path,
         start_dt=start_dt,
@@ -898,6 +1086,7 @@ def main() -> int:
         start_dt=start_dt,
         end_dt=end_dt,
         statistics=statistics,
+        message_size_statistics=message_size_statistics,
         blobs_processed=len(
             successfully_processed_blobs
         ),
@@ -953,7 +1142,29 @@ def main() -> int:
         f"{statistics['average_per_second']:,.2f}"
     )
 
-    print("-" * 60)
+    print("\n" + "=" * 60)
+    print("MESSAGE SIZE STATISTICS")
+    print("=" * 60)
+
+    print(
+        f"Minimum message size: "
+        f"{message_size_statistics['minimum']:,} bytes "
+        f"({bytes_to_kib(message_size_statistics['minimum']):,.2f} KiB)"
+    )
+
+    print(
+        f"Average message size: "
+        f"{message_size_statistics['average']:,.2f} bytes "
+        f"({bytes_to_kib(message_size_statistics['average']):,.2f} KiB)"
+    )
+
+    print(
+        f"Maximum message size: "
+        f"{message_size_statistics['maximum']:,} bytes "
+        f"({bytes_to_kib(message_size_statistics['maximum']):,.2f} KiB)"
+    )
+
+    print("\n" + "-" * 60)
 
     print(
         f"Blobs processed:    "
@@ -972,14 +1183,14 @@ def main() -> int:
             f"{totals['invalid_timestamps']:,}"
         )
 
-    print("\nMinimum observed at:")
+    print("\nMinimum throughput observed at:")
 
     for minute in statistics["minimum_minutes"]:
         print(
             f"  {minute.strftime('%Y-%m-%d %H:%M')}"
         )
 
-    print("Maximum observed at:")
+    print("Maximum throughput observed at:")
 
     for minute in statistics["maximum_minutes"]:
         print(
