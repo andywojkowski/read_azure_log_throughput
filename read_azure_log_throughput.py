@@ -1,4 +1,5 @@
 # file: read_azure_log_throughput.py
+# version: v1.0
 
 import argparse
 import configparser
@@ -13,12 +14,14 @@ from azure.storage.blob import BlobServiceClient
 
 
 DATE_PATTERN = re.compile(
-    r"am_(\d{2}-\d{2}-\d{4})-\d+-.*?_audit\.json"
+    r"(?:am|idm)_(\d{2}-\d{2}-\d{4})-\d+-.*?_audit\.json"
 )
 
 INDEX_PATTERN = re.compile(
     r"^(?:am|idm)_(\d{2}-\d{2}-\d{4})-(\d+)-"
 )
+
+LOG_TYPES = ("am", "idm")
 
 
 def load_config(path: str = "config.ini") -> dict:
@@ -116,7 +119,7 @@ def extract_json_objects(text: str) -> Iterator[str]:
 
 def extract_blob_index(name: str) -> int:
     """
-    Return the numeric sequence number from a blob name.
+    Return the numeric sequence number from an AM or IDM blob name.
     """
     match = INDEX_PATTERN.match(name)
 
@@ -128,12 +131,25 @@ def extract_blob_index(name: str) -> int:
 
 def filter_blobs_by_date(
     container,
+    log_type: str,
     start_date: datetime,
     end_date: datetime,
 ) -> List[str]:
     """
-    Find AM audit blobs for the requested date range.
+    Find audit blobs for one independent log stream.
+
+    log_type must be either:
+      - am
+      - idm
+
+    AM and IDM blobs are deliberately discovered and sorted separately
+    because their sequence numbers represent independent streams.
     """
+    if log_type not in LOG_TYPES:
+        raise ValueError(
+            f"Unsupported log type: {log_type}"
+        )
+
     filtered_blobs = []
 
     current_date = start_date.date()
@@ -141,7 +157,8 @@ def filter_blobs_by_date(
     while current_date <= end_date.date():
 
         prefix = (
-            f"am_{current_date.strftime('%d-%m-%Y')}"
+            f"{log_type}_"
+            f"{current_date.strftime('%d-%m-%Y')}"
         )
 
         daily_blobs = list(
@@ -181,6 +198,13 @@ def filter_blobs_by_date(
 def parse_timestamp(value: object) -> Optional[datetime]:
     """
     Parse a Ping AIC ISO timestamp.
+
+    Supported examples:
+
+        2026-08-26T10:15:23
+        2026-08-26T10:15:23.123
+        2026-08-26T10:15:23.123Z
+        2026-08-26T10:15:23+00:00
     """
     if not isinstance(value, str):
         return None
@@ -218,31 +242,6 @@ def floor_to_minute(value: datetime) -> datetime:
     )
 
 
-def get_message_size(entry: dict) -> int:
-    """
-    Return the UTF-8 size of a log message in bytes.
-
-    A compact JSON representation is used so the measurement reflects
-    the data itself rather than pretty-printing whitespace.
-
-    Example:
-
-        {"timestamp":"...","payload":{...}}
-
-    The result represents the normalized JSON message size rather than
-    the exact byte range occupied by the entry inside the source blob.
-    """
-    serialized = json.dumps(
-        entry,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-    return len(
-        serialized.encode("utf-8")
-    )
-
-
 def initialize_minute_buckets(
     start_dt: datetime,
     end_dt: datetime,
@@ -250,7 +249,7 @@ def initialize_minute_buckets(
     """
     Create every minute bucket touched by the requested period.
 
-    Minutes containing zero messages are deliberately included.
+    Minutes with zero log messages are deliberately retained.
     """
     buckets: Dict[datetime, int] = {}
 
@@ -262,6 +261,27 @@ def initialize_minute_buckets(
         current += timedelta(minutes=1)
 
     return buckets
+
+
+def get_message_size(entry: dict) -> int:
+    """
+    Calculate normalized UTF-8 log-message size in bytes.
+
+    A compact JSON representation is used so whitespace introduced by
+    formatting does not affect the measurement.
+
+    This measures the normalized JSON entry, rather than its exact byte
+    range in the original Azure blob.
+    """
+    serialized = json.dumps(
+        entry,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    return len(
+        serialized.encode("utf-8")
+    )
 
 
 def iter_blob_entries(
@@ -302,29 +322,33 @@ def iter_blob_entries(
 def process_blob(
     container,
     blob_name: str,
+    log_type: str,
     start_dt: datetime,
     end_dt: datetime,
     messages_per_minute: Dict[datetime, int],
 ) -> Tuple[dict, bool]:
     """
-    Count messages from one blob and collect message-size statistics.
+    Process one blob from one log stream.
 
     Returns:
 
         counters
         reached_end
 
-    Because entries and blobs are chronologically ordered,
-    reached_end=True allows the caller to stop processing later blobs.
+    reached_end is scoped to the current stream.
+
+    For example, reaching --end while processing AM blobs must stop
+    later AM blobs but must NOT prevent IDM blobs from being processed.
     """
-    print(f"\nProcessing {blob_name}")
+    print(
+        f"\n[{log_type.upper()}] "
+        f"Processing {blob_name}"
+    )
 
     counters = {
         "entries_seen": 0,
         "entries_in_period": 0,
         "invalid_timestamps": 0,
-
-        # Message-size statistics for this blob.
         "message_size_count": 0,
         "message_size_total": 0,
         "message_size_min": None,
@@ -347,7 +371,7 @@ def process_blob(
             counters["invalid_timestamps"] += 1
             continue
 
-        # Entries are ordered oldest -> newest.
+        # Entries inside each stream are ordered oldest -> newest.
         if ts_dt > end_dt:
             reached_end = True
             break
@@ -361,10 +385,6 @@ def process_blob(
 
         if minute in messages_per_minute:
             messages_per_minute[minute] += 1
-
-        # ----------------------------------------------------------
-        # Message-size statistics
-        # ----------------------------------------------------------
 
         message_size = get_message_size(entry)
 
@@ -391,13 +411,171 @@ def process_blob(
     return counters, reached_end
 
 
+def merge_counters(
+    target: dict,
+    source: dict,
+) -> None:
+    """
+    Merge one blob's counters into a stream/global counter dictionary.
+    """
+    target["entries_seen"] += (
+        source["entries_seen"]
+    )
+
+    target["entries_in_period"] += (
+        source["entries_in_period"]
+    )
+
+    target["invalid_timestamps"] += (
+        source["invalid_timestamps"]
+    )
+
+    target["message_size_count"] += (
+        source["message_size_count"]
+    )
+
+    target["message_size_total"] += (
+        source["message_size_total"]
+    )
+
+    source_min = source["message_size_min"]
+
+    if source_min is not None:
+        if (
+            target["message_size_min"] is None
+            or source_min < target["message_size_min"]
+        ):
+            target["message_size_min"] = source_min
+
+    source_max = source["message_size_max"]
+
+    if source_max is not None:
+        if (
+            target["message_size_max"] is None
+            or source_max > target["message_size_max"]
+        ):
+            target["message_size_max"] = source_max
+
+
+def new_counter_set() -> dict:
+    """
+    Create an empty statistics accumulator.
+    """
+    return {
+        "entries_seen": 0,
+        "entries_in_period": 0,
+        "invalid_timestamps": 0,
+        "message_size_count": 0,
+        "message_size_total": 0,
+        "message_size_min": None,
+        "message_size_max": None,
+    }
+
+
+def process_log_stream(
+    container,
+    log_type: str,
+    blobs: List[str],
+    start_dt: datetime,
+    end_dt: datetime,
+    messages_per_minute: Dict[datetime, int],
+) -> Tuple[dict, List[str]]:
+    """
+    Process one independent log stream.
+
+    AM and IDM are handled separately because their blob indices and
+    timestamp progression are independent.
+
+    Both streams write into the same minute buckets, which automatically
+    produces combined AM + IDM throughput.
+    """
+    stream_totals = new_counter_set()
+    successfully_processed_blobs = []
+
+    print(
+        f"\n{'=' * 60}"
+    )
+
+    print(
+        f"PROCESSING {log_type.upper()} LOG STREAM"
+    )
+
+    print(
+        f"{'=' * 60}"
+    )
+
+    print(
+        f"Found {len(blobs)} candidate "
+        f"{log_type.upper()} blob(s)"
+    )
+
+    for blob_name in blobs:
+
+        try:
+            blob_counters, reached_end = process_blob(
+                container=container,
+                blob_name=blob_name,
+                log_type=log_type,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                messages_per_minute=messages_per_minute,
+            )
+
+        except Exception as exc:
+
+            print(
+                f"\nERROR processing "
+                f"{blob_name}: {exc}"
+            )
+
+            continue
+
+        successfully_processed_blobs.append(
+            blob_name
+        )
+
+        merge_counters(
+            stream_totals,
+            blob_counters,
+        )
+
+        if reached_end:
+
+            print(
+                f"\n[{log_type.upper()}] "
+                "End timestamp reached. "
+                f"Skipping remaining "
+                f"{log_type.upper()} blobs."
+            )
+
+            break
+
+    print(
+        f"\n[{log_type.upper()}] "
+        "Stream total: "
+        f"{stream_totals['entries_in_period']:,} "
+        "messages"
+    )
+
+    print(
+        f"[{log_type.upper()}] "
+        "Blobs processed: "
+        f"{len(successfully_processed_blobs):,}"
+    )
+
+    return (
+        stream_totals,
+        successfully_processed_blobs,
+    )
+
+
 def calculate_statistics(
     messages_per_minute: Dict[datetime, int],
     start_dt: datetime,
     end_dt: datetime,
 ) -> dict:
     """
-    Calculate throughput statistics from minute buckets.
+    Calculate combined AM + IDM throughput statistics.
     """
     values = list(
         messages_per_minute.values()
@@ -427,13 +605,15 @@ def calculate_statistics(
 
     minimum_minutes = [
         minute
-        for minute, count in messages_per_minute.items()
+        for minute, count
+        in messages_per_minute.items()
         if count == minimum
     ]
 
     maximum_minutes = [
         minute
-        for minute, count in messages_per_minute.items()
+        for minute, count
+        in messages_per_minute.items()
         if count == maximum
     ]
 
@@ -462,15 +642,14 @@ def calculate_statistics(
 
 
 def calculate_message_size_statistics(
-    message_size_count: int,
-    message_size_total: int,
-    message_size_min: Optional[int],
-    message_size_max: Optional[int],
+    counters: dict,
 ) -> dict:
     """
-    Calculate overall message-size statistics.
+    Calculate message-size statistics from aggregated counters.
     """
-    if message_size_count == 0:
+    count = counters["message_size_count"]
+
+    if count == 0:
         return {
             "count": 0,
             "minimum": 0,
@@ -479,19 +658,19 @@ def calculate_message_size_statistics(
         }
 
     return {
-        "count": message_size_count,
+        "count": count,
         "minimum": (
-            message_size_min
-            if message_size_min is not None
+            counters["message_size_min"]
+            if counters["message_size_min"] is not None
             else 0
         ),
         "average": (
-            message_size_total
-            / message_size_count
+            counters["message_size_total"]
+            / count
         ),
         "maximum": (
-            message_size_max
-            if message_size_max is not None
+            counters["message_size_max"]
+            if counters["message_size_max"] is not None
             else 0
         ),
     }
@@ -509,9 +688,7 @@ def write_csv_report(
     messages_per_minute: Dict[datetime, int],
 ) -> None:
     """
-    Write the per-minute throughput table as CSV.
-
-    Message-size statistics are intentionally not included here.
+    Write combined AM + IDM per-minute throughput as CSV.
     """
     with open(
         output_path,
@@ -545,15 +722,15 @@ def write_json_report(
     end_dt: datetime,
     messages_per_minute: Dict[datetime, int],
     statistics: dict,
-    blobs_processed: int,
-    entries_seen: int,
-    invalid_timestamps: int,
+    am_totals: dict,
+    idm_totals: dict,
+    am_blobs_processed: int,
+    idm_blobs_processed: int,
 ) -> None:
     """
-    Write detailed JSON output.
+    Write combined throughput JSON.
 
-    Message-size statistics are intentionally not included because
-    they are summary-only metrics.
+    Message-size statistics remain summary-only.
     """
     report = {
         "period": {
@@ -563,6 +740,8 @@ def write_json_report(
         "summary": {
             "minutesCovered": statistics["minutes"],
             "totalMessages": statistics["total_messages"],
+            "amMessages": am_totals["entries_in_period"],
+            "idmMessages": idm_totals["entries_in_period"],
             "minimumMessagesPerMinute": (
                 statistics["minimum_per_minute"]
             ),
@@ -579,22 +758,24 @@ def write_json_report(
             ),
             "minimumMinutes": [
                 minute.isoformat()
-                for minute in statistics["minimum_minutes"]
+                for minute
+                in statistics["minimum_minutes"]
             ],
             "maximumMinutes": [
                 minute.isoformat()
-                for minute in statistics["maximum_minutes"]
+                for minute
+                in statistics["maximum_minutes"]
             ],
-            "blobsProcessed": blobs_processed,
-            "entriesSeen": entries_seen,
-            "invalidTimestamps": invalid_timestamps,
+            "amBlobsProcessed": am_blobs_processed,
+            "idmBlobsProcessed": idm_blobs_processed,
         },
         "minutes": [
             {
                 "minute": minute.isoformat(),
                 "messages": count,
             }
-            for minute, count in messages_per_minute.items()
+            for minute, count
+            in messages_per_minute.items()
         ],
     }
 
@@ -621,12 +802,13 @@ def write_summary_log(
     end_dt: datetime,
     statistics: dict,
     message_size_statistics: dict,
-    blobs_processed: int,
-    entries_seen: int,
-    invalid_timestamps: int,
+    am_totals: dict,
+    idm_totals: dict,
+    am_blobs_processed: int,
+    idm_blobs_processed: int,
 ) -> None:
     """
-    Write a human-readable summary.
+    Write the human-readable combined summary.
     """
     lines = []
 
@@ -649,23 +831,21 @@ def write_summary_log(
     lines.append("")
 
     lines.append(
-        f"Blobs processed:      "
-        f"{blobs_processed:,}"
+        "SOURCE BREAKDOWN"
     )
 
     lines.append(
-        f"Entries seen:         "
-        f"{entries_seen:,}"
+        "-" * 60
     )
 
     lines.append(
-        f"Invalid timestamps:   "
-        f"{invalid_timestamps:,}"
+        f"AM messages:          "
+        f"{am_totals['entries_in_period']:,}"
     )
 
     lines.append(
-        f"Minutes covered:      "
-        f"{statistics['minutes']:,}"
+        f"IDM messages:         "
+        f"{idm_totals['entries_in_period']:,}"
     )
 
     lines.append(
@@ -676,11 +856,45 @@ def write_summary_log(
     lines.append("")
 
     lines.append(
-        "MESSAGE THROUGHPUT"
+        f"AM blobs processed:   "
+        f"{am_blobs_processed:,}"
+    )
+
+    lines.append(
+        f"IDM blobs processed:  "
+        f"{idm_blobs_processed:,}"
+    )
+
+    lines.append(
+        f"Total blobs:          "
+        f"{am_blobs_processed + idm_blobs_processed:,}"
+    )
+
+    lines.append("")
+
+    lines.append(
+        f"AM invalid timestamps:  "
+        f"{am_totals['invalid_timestamps']:,}"
+    )
+
+    lines.append(
+        f"IDM invalid timestamps: "
+        f"{idm_totals['invalid_timestamps']:,}"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "COMBINED MESSAGE THROUGHPUT"
     )
 
     lines.append(
         "-" * 60
+    )
+
+    lines.append(
+        f"Minutes covered:      "
+        f"{statistics['minutes']:,}"
     )
 
     lines.append(
@@ -706,7 +920,7 @@ def write_summary_log(
     lines.append("")
 
     lines.append(
-        "MESSAGE SIZE"
+        "COMBINED MESSAGE SIZE"
     )
 
     lines.append(
@@ -769,17 +983,24 @@ def print_verbose_minute_table(
     messages_per_minute: Dict[datetime, int],
 ) -> None:
     """
-    Print all per-minute counters to the console.
+    Print combined AM + IDM per-minute counters.
     """
-    print("\nPER-MINUTE MESSAGE COUNTS")
-    print("=" * 45)
+    print(
+        "\nCOMBINED PER-MINUTE MESSAGE COUNTS"
+    )
+
+    print(
+        "=" * 45
+    )
 
     print(
         f"{'Minute':<22}"
         f"{'Messages':>15}"
     )
 
-    print("-" * 45)
+    print(
+        "-" * 45
+    )
 
     for minute, count in messages_per_minute.items():
 
@@ -793,9 +1014,9 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Calculate Ping AIC log-message throughput "
-            "per minute and message-size statistics "
-            "from Azure Blob Storage audit logs."
+            "Calculate combined Ping AIC AM + IDM log-message "
+            "throughput and message-size statistics from "
+            "Azure Blob Storage audit logs."
         )
     )
 
@@ -837,8 +1058,8 @@ def main() -> int:
         "--verbose",
         action="store_true",
         help=(
-            "Print the complete per-minute throughput "
-            "table to the console."
+            "Print the complete combined per-minute "
+            "throughput table."
         ),
     )
 
@@ -885,123 +1106,96 @@ def main() -> int:
     )
 
     print(
-        "\nSearching blobs between "
+        "\nSearching AM and IDM blobs between "
         f"{start_dt} and {end_dt}"
     )
 
     try:
-        blobs = filter_blobs_by_date(
-            container,
-            start_dt,
-            end_dt,
+        am_blobs = filter_blobs_by_date(
+            container=container,
+            log_type="am",
+            start_date=start_dt,
+            end_date=end_dt,
+        )
+
+        idm_blobs = filter_blobs_by_date(
+            container=container,
+            log_type="idm",
+            start_date=start_dt,
+            end_date=end_dt,
         )
 
     except Exception as exc:
+
         print(
             "\nFailed to list Azure blobs:"
         )
 
-        print(str(exc))
+        print(
+            str(exc)
+        )
 
         return 1
 
     print(
-        f"Found {len(blobs)} candidate blob(s)"
+        f"Found {len(am_blobs)} AM candidate blob(s)"
     )
 
+    print(
+        f"Found {len(idm_blobs)} IDM candidate blob(s)"
+    )
+
+    # Shared buckets intentionally combine AM and IDM.
     messages_per_minute = initialize_minute_buckets(
         start_dt=start_dt,
         end_dt=end_dt,
     )
 
-    totals = {
-        "entries_seen": 0,
-        "entries_in_period": 0,
-        "invalid_timestamps": 0,
+    # ----------------------------------------------------------
+    # AM
+    # ----------------------------------------------------------
 
-        # Global message-size aggregation.
-        "message_size_count": 0,
-        "message_size_total": 0,
-        "message_size_min": None,
-        "message_size_max": None,
-    }
+    am_totals, processed_am_blobs = process_log_stream(
+        container=container,
+        log_type="am",
+        blobs=am_blobs,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        messages_per_minute=messages_per_minute,
+    )
 
-    successfully_processed_blobs = []
+    # ----------------------------------------------------------
+    # IDM
+    # ----------------------------------------------------------
 
-    for blob_name in blobs:
+    idm_totals, processed_idm_blobs = process_log_stream(
+        container=container,
+        log_type="idm",
+        blobs=idm_blobs,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        messages_per_minute=messages_per_minute,
+    )
 
-        try:
-            blob_counters, reached_end = process_blob(
-                container=container,
-                blob_name=blob_name,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                messages_per_minute=messages_per_minute,
-            )
+    # ----------------------------------------------------------
+    # Combine stream-level message size accumulators.
+    # ----------------------------------------------------------
 
-        except Exception as exc:
+    combined_totals = new_counter_set()
 
-            print(
-                f"\nERROR processing {blob_name}: "
-                f"{exc}"
-            )
+    merge_counters(
+        combined_totals,
+        am_totals,
+    )
 
-            continue
+    merge_counters(
+        combined_totals,
+        idm_totals,
+    )
 
-        successfully_processed_blobs.append(
-            blob_name
-        )
-
-        totals["entries_seen"] += (
-            blob_counters["entries_seen"]
-        )
-
-        totals["entries_in_period"] += (
-            blob_counters["entries_in_period"]
-        )
-
-        totals["invalid_timestamps"] += (
-            blob_counters["invalid_timestamps"]
-        )
-
-        totals["message_size_count"] += (
-            blob_counters["message_size_count"]
-        )
-
-        totals["message_size_total"] += (
-            blob_counters["message_size_total"]
-        )
-
-        blob_min = blob_counters[
-            "message_size_min"
-        ]
-
-        if blob_min is not None:
-            if (
-                totals["message_size_min"] is None
-                or blob_min < totals["message_size_min"]
-            ):
-                totals["message_size_min"] = blob_min
-
-        blob_max = blob_counters[
-            "message_size_max"
-        ]
-
-        if blob_max is not None:
-            if (
-                totals["message_size_max"] is None
-                or blob_max > totals["message_size_max"]
-            ):
-                totals["message_size_max"] = blob_max
-
-        if reached_end:
-
-            print(
-                "\nEnd timestamp reached. "
-                "Skipping remaining blobs."
-            )
-
-            break
+    # ----------------------------------------------------------
+    # Final combined statistics.
+    # ----------------------------------------------------------
 
     statistics = calculate_statistics(
         messages_per_minute=messages_per_minute,
@@ -1011,18 +1205,7 @@ def main() -> int:
 
     message_size_statistics = (
         calculate_message_size_statistics(
-            message_size_count=totals[
-                "message_size_count"
-            ],
-            message_size_total=totals[
-                "message_size_total"
-            ],
-            message_size_min=totals[
-                "message_size_min"
-            ],
-            message_size_max=totals[
-                "message_size_max"
-            ],
+            combined_totals
         )
     )
 
@@ -1064,21 +1247,20 @@ def main() -> int:
         messages_per_minute=messages_per_minute,
     )
 
-    # Deliberately unchanged:
-    # message-size metrics are summary-only.
     write_json_report(
         output_path=json_path,
         start_dt=start_dt,
         end_dt=end_dt,
         messages_per_minute=messages_per_minute,
         statistics=statistics,
-        blobs_processed=len(
-            successfully_processed_blobs
+        am_totals=am_totals,
+        idm_totals=idm_totals,
+        am_blobs_processed=len(
+            processed_am_blobs
         ),
-        entries_seen=totals["entries_seen"],
-        invalid_timestamps=totals[
-            "invalid_timestamps"
-        ],
+        idm_blobs_processed=len(
+            processed_idm_blobs
+        ),
     )
 
     write_summary_log(
@@ -1087,13 +1269,14 @@ def main() -> int:
         end_dt=end_dt,
         statistics=statistics,
         message_size_statistics=message_size_statistics,
-        blobs_processed=len(
-            successfully_processed_blobs
+        am_totals=am_totals,
+        idm_totals=idm_totals,
+        am_blobs_processed=len(
+            processed_am_blobs
         ),
-        entries_seen=totals["entries_seen"],
-        invalid_timestamps=totals[
-            "invalid_timestamps"
-        ],
+        idm_blobs_processed=len(
+            processed_idm_blobs
+        ),
     )
 
     if args.verbose:
@@ -1101,13 +1284,42 @@ def main() -> int:
             messages_per_minute
         )
 
-    print("\n" + "=" * 60)
-    print("LOG THROUGHPUT STATISTICS")
-    print("=" * 60)
+    # ----------------------------------------------------------
+    # Console summary
+    # ----------------------------------------------------------
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "COMBINED LOG THROUGHPUT STATISTICS"
+    )
+
+    print(
+        "=" * 60
+    )
 
     print(
         f"Period:             "
         f"{start_dt} -> {end_dt}"
+    )
+
+    print("")
+
+    print(
+        f"AM messages:        "
+        f"{am_totals['entries_in_period']:,}"
+    )
+
+    print(
+        f"IDM messages:       "
+        f"{idm_totals['entries_in_period']:,}"
+    )
+
+    print(
+        f"Total messages:     "
+        f"{statistics['total_messages']:,}"
     )
 
     print(
@@ -1116,11 +1328,8 @@ def main() -> int:
     )
 
     print(
-        f"Total messages:     "
-        f"{statistics['total_messages']:,}"
+        "-" * 60
     )
-
-    print("-" * 60)
 
     print(
         f"Minimum / minute:   "
@@ -1142,9 +1351,17 @@ def main() -> int:
         f"{statistics['average_per_second']:,.2f}"
     )
 
-    print("\n" + "=" * 60)
-    print("MESSAGE SIZE STATISTICS")
-    print("=" * 60)
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "COMBINED MESSAGE SIZE STATISTICS"
+    )
+
+    print(
+        "=" * 60
+    )
 
     print(
         f"Minimum message size: "
@@ -1164,33 +1381,37 @@ def main() -> int:
         f"({bytes_to_kib(message_size_statistics['maximum']):,.2f} KiB)"
     )
 
-    print("\n" + "-" * 60)
-
     print(
-        f"Blobs processed:    "
-        f"{len(successfully_processed_blobs):,}"
+        "\n" + "-" * 60
     )
 
     print(
-        f"Entries inspected:  "
-        f"{totals['entries_seen']:,}"
+        f"AM blobs processed:  "
+        f"{len(processed_am_blobs):,}"
     )
 
-    if totals["invalid_timestamps"]:
+    print(
+        f"IDM blobs processed: "
+        f"{len(processed_idm_blobs):,}"
+    )
 
-        print(
-            f"Invalid timestamps: "
-            f"{totals['invalid_timestamps']:,}"
-        )
+    print(
+        f"Total blobs:         "
+        f"{len(processed_am_blobs) + len(processed_idm_blobs):,}"
+    )
 
-    print("\nMinimum throughput observed at:")
+    print(
+        "\nMinimum throughput observed at:"
+    )
 
     for minute in statistics["minimum_minutes"]:
         print(
             f"  {minute.strftime('%Y-%m-%d %H:%M')}"
         )
 
-    print("Maximum throughput observed at:")
+    print(
+        "Maximum throughput observed at:"
+    )
 
     for minute in statistics["maximum_minutes"]:
         print(
